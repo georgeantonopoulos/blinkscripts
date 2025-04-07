@@ -1,0 +1,126 @@
+#define PI 3.14159265359f
+
+// Simple spatial hash function (generates float 0-1 from int2)
+float hash(int2 p) {
+  unsigned int h = (unsigned int)p.x * 73856093u ^ (unsigned int)p.y * 19349663u;
+  h = (h ^ 61u) ^ (h >> 16u);
+  h = h * 9u;
+  h = (h ^ 61u) ^ (h >> 16u);
+  h = h * 9u;
+  h = h ^ (h >> 4u);
+  h = h * 668265261u;
+  h = h ^ (h >> 15u);
+  return float(h) / 4294967295.0f;
+}
+
+kernel GlintGenerator : ImageComputationKernel<ePixelWise> {
+  Image<eRead, eAccessRandom, eEdgeClamped> src; // Input image with random access
+  Image<eWrite> dst; // Output image - Now only the effect
+
+  // Parameters
+  param:
+    float threshold;
+    float size;
+    float intensity;
+    int   num_arms;
+    float thickness; // degrees
+    float rotation;  // degrees
+    float falloff;
+    float sharpness;
+    float aberration;
+    float sizeLuminanceScale; // How much luminance affects size
+    float sizeVariation;      // Random size variation (0-1)
+    float rotationVariation;  // Random rotation variation (degrees)
+    float intensityVariation; // Random intensity variation (0-1)
+
+  // Define parameters with defaults and labels for the Nuke UI
+  void define() {
+    defineParam(threshold, "Threshold", 0.8f);
+    defineParam(size, "Size", 50.0f);
+    defineParam(intensity, "Intensity", 1.0f);
+    defineParam(num_arms, "Arms", 12);
+    defineParam(thickness, "Thickness (Deg)", 1.5f);
+    defineParam(rotation, "Rotation (Deg)", 0.0f);
+    defineParam(falloff, "Falloff", 1.0f);
+    defineParam(sharpness, "Sharpness", 2.5f);
+    defineParam(aberration, "Aberration", 0.01f);
+    defineParam(sizeLuminanceScale, "Size Luma Scale", 0.5f);
+    defineParam(sizeVariation, "Size Variation", 0.2f);
+    defineParam(rotationVariation, "Rotation Variation", 15.0f);
+    defineParam(intensityVariation, "Intensity Variation", 0.3f);
+  }
+
+  // Process function executed for each output pixel
+  void process(int2 pos) {
+    float4 finalGlintColor = float4(0.0f);
+    int baseSearchRadius = int(ceil(size * (1.0f + sizeLuminanceScale + sizeVariation))); // Estimate max possible search radius
+    float thicknessRad = thickness * PI / 180.0f;
+    float baseRotationRad = rotation * PI / 180.0f; // Store base rotation
+
+    for (int iy_offset = -baseSearchRadius; iy_offset <= baseSearchRadius; ++iy_offset) {
+      for (int ix_offset = -baseSearchRadius; ix_offset <= baseSearchRadius; ++ix_offset) {
+        int2 offset = int2(ix_offset, iy_offset);
+        int2 center_pos = pos + offset;
+        float4 centerPixelValue = src(center_pos.x, center_pos.y);
+        float centerLuminance = dot(float3(centerPixelValue.x, centerPixelValue.y, centerPixelValue.z), float3(0.2126f, 0.7152f, 0.0722f));
+
+        if (centerLuminance > threshold) {
+          // --- Calculate per-highlight variations ---
+          float randVal1 = hash(center_pos);
+          float randVal2 = hash(center_pos + int2(1, 1)); // Offset hash for rotation
+          float randVal3 = hash(center_pos - int2(1, 1)); // Hash for intensity
+
+          // Size variation based on luminance and randomness
+          float currentSize = size * (1.0f + sizeLuminanceScale * (centerLuminance - threshold)); // Luma scale applied first
+          currentSize = currentSize * (1.0f + sizeVariation * (randVal1 * 2.0f - 1.0f)); // Then random variation (+/-)
+          currentSize = max(0.0f, currentSize); // Ensure size >= 0
+
+          // Rotation variation based on randomness
+          float currentRotationRad = baseRotationRad + rotationVariation * (PI / 180.0f) * (randVal2 * 2.0f - 1.0f); // +/- variation
+
+          // Apply Intensity Variation
+          float currentIntensity = intensity * (1.0f + intensityVariation * (randVal3 * 2.0f - 1.0f));
+          currentIntensity = max(0.0f, currentIntensity); // Ensure >= 0
+
+          // --- Proceed with calculations using currentSize and currentRotationRad ---
+          float2 delta = float2(float(-ix_offset), float(-iy_offset));
+          float dist = length(delta);
+
+          // --- Glint Arm Calculation ---
+          if (dist > 1e-5f && dist < currentSize) { // Use currentSize
+            float angle = atan2(delta.y, delta.x) + currentRotationRad; // Use currentRotationRad
+            float min_angle_diff = PI;
+            for (int i = 0; i < num_arms; ++i) {
+              float arm_angle = (2.0f * PI * i) / num_arms;
+              float diff = angle - arm_angle;
+              diff = atan2(sin(diff), cos(diff));
+              min_angle_diff = min(min_angle_diff, fabs(diff));
+            }
+
+            if (min_angle_diff < thicknessRad / 2.0f) {
+              float sharpness_factor = cos(min_angle_diff * PI / thicknessRad);
+              sharpness_factor = pow(sharpness_factor, sharpness);
+              float base_glint_brightness = currentIntensity * centerLuminance * sharpness_factor;
+
+              // Use currentSize for falloff distances
+              float dist_r = dist * (1.0f - aberration);
+              float dist_g = dist;
+              float dist_b = dist * (1.0f + aberration);
+
+              float falloff_r = pow(max(0.0f, 1.0f - (dist_r / currentSize)), falloff);
+              float falloff_g = pow(max(0.0f, 1.0f - (dist_g / currentSize)), falloff);
+              float falloff_b = pow(max(0.0f, 1.0f - (dist_b / currentSize)), falloff);
+
+              finalGlintColor.x += centerPixelValue.x * base_glint_brightness * falloff_r;
+              finalGlintColor.y += centerPixelValue.y * base_glint_brightness * falloff_g;
+              finalGlintColor.z += centerPixelValue.z * base_glint_brightness * falloff_b;
+            }
+          }
+        }
+      }
+    }
+
+    finalGlintColor.w = max(finalGlintColor.x, max(finalGlintColor.y, finalGlintColor.z));
+    dst() = finalGlintColor;
+  }
+}; 
