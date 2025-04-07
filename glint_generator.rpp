@@ -32,6 +32,10 @@ kernel GlintGenerator : ImageComputationKernel<ePixelWise> {
     float sizeVariation;      // Random size variation (0-1)
     float rotationVariation;  // Random rotation variation (degrees)
     float intensityVariation; // Random intensity variation (0-1)
+    float thicknessVariation; // Thickness variation (0-1)
+    float thresholdSmoothness; // Smoothness range above threshold
+    float aberrationVariation; // Random variation in aberration strength (0-1)
+    float thicknessFalloff;    // How thickness decreases with distance (e.g., 1.0)
 
   // Define parameters with defaults and labels for the Nuke UI
   void define() {
@@ -48,13 +52,17 @@ kernel GlintGenerator : ImageComputationKernel<ePixelWise> {
     defineParam(sizeVariation, "Size Variation", 0.2f);
     defineParam(rotationVariation, "Rotation Variation", 15.0f);
     defineParam(intensityVariation, "Intensity Variation", 0.3f);
+    defineParam(thicknessVariation, "Thickness Variation", 0.5f);
+    defineParam(thresholdSmoothness, "Threshold Smoothness", 0.1f);
+    defineParam(aberrationVariation, "Aberration Variation", 0.5f);
+    defineParam(thicknessFalloff, "Thickness Falloff", 1.0f);
   }
 
   // Process function executed for each output pixel
   void process(int2 pos) {
     float4 finalGlintColor = float4(0.0f);
     int baseSearchRadius = int(ceil(size * (1.0f + sizeLuminanceScale + sizeVariation))); // Estimate max possible search radius
-    float thicknessRad = thickness * PI / 180.0f;
+    float baseThicknessRad = thickness * PI / 180.0f; // Store base thickness
     float baseRotationRad = rotation * PI / 180.0f; // Store base rotation
 
     for (int iy_offset = -baseSearchRadius; iy_offset <= baseSearchRadius; ++iy_offset) {
@@ -65,10 +73,17 @@ kernel GlintGenerator : ImageComputationKernel<ePixelWise> {
         float centerLuminance = dot(float3(centerPixelValue.x, centerPixelValue.y, centerPixelValue.z), float3(0.2126f, 0.7152f, 0.0722f));
 
         if (centerLuminance > threshold) {
+          // --- Calculate Threshold Factor ---
+          float thresholdFactor = 1.0f;
+          if (thresholdSmoothness > 1e-5f) { // Avoid division by zero
+              thresholdFactor = clamp((centerLuminance - threshold) / thresholdSmoothness, 0.0f, 1.0f);
+          }
+
           // --- Calculate per-highlight variations ---
           float randVal1 = hash(center_pos);
-          float randVal2 = hash(center_pos + int2(1, 1)); // Offset hash for rotation
-          float randVal3 = hash(center_pos - int2(1, 1)); // Hash for intensity
+          float randVal2 = hash(center_pos + int2(1, 1));
+          float randVal3 = hash(center_pos - int2(1, 1));
+          float randVal4 = hash(center_pos + int2(1, 0));
 
           // Size variation based on luminance and randomness
           float currentSize = size * (1.0f + sizeLuminanceScale * (centerLuminance - threshold)); // Luma scale applied first
@@ -82,6 +97,10 @@ kernel GlintGenerator : ImageComputationKernel<ePixelWise> {
           float currentIntensity = intensity * (1.0f + intensityVariation * (randVal3 * 2.0f - 1.0f));
           currentIntensity = max(0.0f, currentIntensity); // Ensure >= 0
 
+          // Calculate varied aberration strength
+          float currentAberration = aberration * (1.0f + aberrationVariation * (randVal4 * 2.0f - 1.0f));
+          currentAberration = max(0.0f, currentAberration); // Ensure >= 0
+
           // --- Proceed with calculations using currentSize and currentRotationRad ---
           float2 delta = float2(float(-ix_offset), float(-iy_offset));
           float dist = length(delta);
@@ -90,22 +109,44 @@ kernel GlintGenerator : ImageComputationKernel<ePixelWise> {
           if (dist > 1e-5f && dist < currentSize) { // Use currentSize
             float angle = atan2(delta.y, delta.x) + currentRotationRad; // Use currentRotationRad
             float min_angle_diff = PI;
+            float closest_arm_angle = 0.0f; // Store angle of the closest arm
+
+            // Find closest arm and its angle
             for (int i = 0; i < num_arms; ++i) {
               float arm_angle = (2.0f * PI * i) / num_arms;
               float diff = angle - arm_angle;
-              diff = atan2(sin(diff), cos(diff));
-              min_angle_diff = min(min_angle_diff, fabs(diff));
+              diff = atan2(sin(diff), cos(diff)); // Normalize diff
+              float abs_diff = fabs(diff);
+              if (abs_diff < min_angle_diff) {
+                  min_angle_diff = abs_diff;
+                  closest_arm_angle = arm_angle; // Store this arm's angle
+              }
             }
 
-            if (min_angle_diff < thicknessRad / 2.0f) {
-              float sharpness_factor = cos(min_angle_diff * PI / thicknessRad);
-              sharpness_factor = pow(sharpness_factor, sharpness);
-              float base_glint_brightness = currentIntensity * centerLuminance * sharpness_factor;
+            // Calculate thickness variation based on closest arm's orientation
+            float orientation_factor = cos(closest_arm_angle * 2.0f); // +1 horizontal, -1 vertical, 0 diagonal
+            float currentThicknessRad = baseThicknessRad * (1.0f + thicknessVariation * orientation_factor);
+            currentThicknessRad = max(1e-5f, currentThicknessRad); // Prevent zero thickness
 
-              // Use currentSize for falloff distances
-              float dist_r = dist * (1.0f - aberration);
+            // Calculate distance-based thickness falloff factor
+            float distanceThicknessFactor = pow(max(0.0f, 1.0f - (dist / currentSize)), thicknessFalloff);
+
+            // Apply falloff to get final thickness for this pixel
+            float finalThicknessRad = currentThicknessRad * distanceThicknessFactor;
+            finalThicknessRad = max(1e-5f, finalThicknessRad); // Ensure non-zero
+
+            // Check against the final varied thickness
+            if (min_angle_diff < finalThicknessRad / 2.0f) {
+              // Use finalThicknessRad for sharpness calculation
+              float sharpness_factor = cos(min_angle_diff * PI / finalThicknessRad);
+              sharpness_factor = pow(sharpness_factor, sharpness);
+              float base_glint_brightness = currentIntensity * centerLuminance * sharpness_factor * thresholdFactor;
+
+              // Apply REVERSED + VARIED aberration for falloff (Warm Center / Cool Tips)
+              // Red/Green fall off together, Blue falls off slowest
+              float dist_r = dist; // Make Red fall off same as Green
               float dist_g = dist;
-              float dist_b = dist * (1.0f + aberration);
+              float dist_b = dist * (1.0f - currentAberration); // '-' makes distance smaller -> slower falloff
 
               float falloff_r = pow(max(0.0f, 1.0f - (dist_r / currentSize)), falloff);
               float falloff_g = pow(max(0.0f, 1.0f - (dist_g / currentSize)), falloff);
