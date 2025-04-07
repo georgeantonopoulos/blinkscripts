@@ -356,9 +356,6 @@ Debugging Blink scripts in Nuke can sometimes be challenging because the error m
 | vec       | Placeholder for any of the vector types (int1–4, float1–4).  | `vec v = float2(1.0f, 2.0f);`                   |
 | int_type  | Placeholder for any integer scalar or vector type.       | `int_type count = 5;`                           |
 
-## Conclusion
-
-Blink scripting offers a powerful and versatile toolset for VFX artists and compositors working in Nuke. Its "C++-like" syntax, combined with its ability to leverage both CPU and GPU processing, allows for the creation of highly optimized custom image processing effects that extend beyond the capabilities of standard Nuke nodes and Python scripting. By understanding the core concepts of kernel structure, granularity, and image access—as well as the available data types and built-in functions—users can harness Blink to develop innovative solutions for a wide range of creative and technical challenges.
 
 ## Works Cited
 
@@ -378,6 +375,3 @@ Blink scripting offers a powerful and versatile toolset for VFX artists and comp
 - [KnobScripter v3.1 User Guide - Adrian Pueyo](https://adrianpueyo.com/KnobScripter_v3.1.pdf)
 - [Nuke not printing full Blink script compile error : r/NukeVFX - Reddit](https://www.reddit.com/r/NukeVFX/comments/943e0w/nuke_not_printing_full_blink_script_compile_error/)
 
----
-
-Feel free to adjust the headings or formatting as needed for your workflow.
