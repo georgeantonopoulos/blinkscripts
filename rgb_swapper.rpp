@@ -1,0 +1,22 @@
+kernel RGB_Swapper : ImageComputationKernel<ePixelWise> {
+  Image<eRead, eAccessPoint, eEdgeClamped> src; // Input image
+  Image<eWrite> dst; // Output image
+
+  // Process function executed for each pixel
+  void process() {
+    // Read the source pixel (RGBA)
+    float4 inputPixel = src();
+
+    // Create a new float4 for the output pixel
+    float4 outputPixel;
+
+    // Swap the RGB channels: R -> G, G -> B, B -> R
+    outputPixel.x = inputPixel.y; // Output Red = Input Green
+    outputPixel.y = inputPixel.z; // Output Green = Input Blue
+    outputPixel.z = inputPixel.x; // Output Blue = Input Red
+    outputPixel.w = inputPixel.w; // Keep Alpha the same
+
+    // Write the swapped pixel to the destination
+    dst() = outputPixel;
+  }
+}; 
