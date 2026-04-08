@@ -1,0 +1,317 @@
+// halation_anamorphic.rpp
+// Realistic halation + anamorphic lens flare — Nuke BlinkScript (image kernel).
+//
+// ---------------------------------------------------------------------------
+// Physics background
+// ---------------------------------------------------------------------------
+// Halation (warm radial glow around highlights):
+//   On motion picture film stock, light from bright highlights penetrates the
+//   emulsion, reflects off the clear film base behind it, and re-exposes the
+//   emulsion from the back. Longer-wavelength red light penetrates deepest
+//   and reflects most strongly, so real halation is heavily red/orange, with
+//   the green and blue contributions falling off at much smaller effective
+//   radii. This kernel models that with PER-CHANNEL radial extents (red
+//   reaches the full "Halation Size"; green and blue scale down by Halation
+//   Green/Blue Scale) and a warm tint multiplier. That wavelength split is
+//   the thing most halation implementations get wrong — a single radial blur
+//   with a warm tint gives the wrong fall-off shape.
+//
+// Anamorphic streak (horizontal light stretching):
+//   Anamorphic cinema lenses use cylindrical glass elements that squeeze the
+//   image ~2x horizontally. Bright light sources hitting those elements
+//   produce a long, narrow horizontal streak. Coatings on the anamorphic
+//   elements tint the streak toward cool/blue — the classic look. The
+//   profile is Gaussian perpendicular (narrow vertical cross-section) and
+//   exponentially decaying along its length. Chromatic dispersion makes blue
+//   travel slightly further than red along the streak axis, so the tips
+//   naturally skew cool even before any explicit tinting.
+//
+// ---------------------------------------------------------------------------
+// How this kernel works
+// ---------------------------------------------------------------------------
+// For every output pixel, the kernel sweeps a neighborhood of source pixels
+// (a gather-style accumulator — same pattern used by glint_simple.rpp and
+// glint_generator.rpp in this repo). For each source pixel that passes a
+// Rec.709 luminance threshold, a halation contribution and a streak
+// contribution are added to the output. Most pixels in the search window
+// fail the threshold and early-exit, so the practical cost scales with the
+// number of bright pixels, not the raw window area.
+//
+// Output is source + (halation + streak) * mix, so one node gives you the
+// final look. Set Mix to 0 to bypass the effect entirely.
+//
+// ---------------------------------------------------------------------------
+// Key parameters
+// ---------------------------------------------------------------------------
+//   Threshold             : Rec.709 luminance above which a pixel becomes a
+//                           seed for the effect. 0.85 works for linear EXRs.
+//   Threshold Smoothness  : soft ramp width above the hard cutoff.
+//   HDR Knee              : Reinhard-style compression of super-bright seeds
+//                           so individual pixels above 10.0 don't dominate.
+//
+//   Halation Size         : radius of the RED halation in pixels.
+//   Halation Green/Blue Scale : radius scale for G and B relative to R,
+//                           modelling the wavelength-penetration split.
+//                           Defaults 0.55 / 0.30 give the characteristic
+//                           warm outer ring fading to almost nothing in B.
+//   Halation Tint R/G/B   : warm color multiplier applied to the glow.
+//   Halation Decay        : exponential decay rate (higher = tighter).
+//   Halation Intensity    : overall halation strength.
+//
+//   Streak Length         : half-length of the horizontal streak in pixels.
+//                           The streak extends +/- this many pixels from
+//                           each bright source pixel.
+//   Streak Width          : perpendicular Gaussian sigma in pixels. 2-4 is
+//                           typical for a tight anamorphic look.
+//   Streak Decay          : exponential decay along the streak length.
+//   Streak Tint R/G/B     : cool color multiplier at the streak tips.
+//   Streak Chroma         : 0..1 — how strongly the tip color overrides the
+//                           source color at the streak ends.
+//   Streak Aberration     : 0..1 — chromatic dispersion. Higher values make
+//                           blue reach further than red along the streak.
+//   Streak Intensity      : overall streak strength.
+//
+//   Mix                   : 0 = source untouched, 1 = full effect composited.
+//   Quality               : loop stride. 1 = final, 2/4 = fast previews
+//                           (with automatic area compensation so brightness
+//                           matches the final at Quality 1).
+//
+// Works best on linear-light footage. For log/srgb input, linearize first
+// or raise Threshold.
+
+#define PI 3.14159265359f
+
+// Rec. 709 luminance weights — house convention across this repo
+#define LUMA_R 0.2126f
+#define LUMA_G 0.7152f
+#define LUMA_B 0.0722f
+
+kernel HalationAnamorphic : ImageComputationKernel<ePixelWise>
+{
+  Image<eRead, eAccessRandom, eEdgeClamped> src;
+  Image<eWrite>                             dst;
+
+  param:
+    // Highlight detection
+    float threshold;
+    float thresholdSmoothness;
+    float hdrKnee;
+
+    // Halation (warm radial glow with per-channel radii)
+    float halationSize;
+    float halationIntensity;
+    float halationDecay;
+    float halationGreenScale;
+    float halationBlueScale;
+    float halationTintR;
+    float halationTintG;
+    float halationTintB;
+
+    // Anamorphic streak (horizontal)
+    float streakLength;
+    float streakWidth;
+    float streakIntensity;
+    float streakDecay;
+    float streakTintR;
+    float streakTintG;
+    float streakTintB;
+    float streakChroma;
+    float streakAberration;
+
+    // Composite
+    float mix;
+    int   quality;
+
+  local:
+    int halRadius;
+    int strRadiusX;
+    int strRadiusY;
+    int qStep;
+
+  void define() {
+    defineParam(threshold,            "Threshold",              0.85f);
+    defineParam(thresholdSmoothness,  "Threshold Smoothness",   0.08f);
+    defineParam(hdrKnee,              "HDR Knee",               1.0f);
+
+    defineParam(halationSize,         "Halation Size",          60.0f, eParamProxyScale);
+    defineParam(halationIntensity,    "Halation Intensity",     1.25f);
+    defineParam(halationDecay,        "Halation Decay",         2.2f);
+    defineParam(halationGreenScale,   "Halation Green Scale",   0.55f);
+    defineParam(halationBlueScale,    "Halation Blue Scale",    0.30f);
+    defineParam(halationTintR,        "Halation Tint R",        1.00f);
+    defineParam(halationTintG,        "Halation Tint G",        0.55f);
+    defineParam(halationTintB,        "Halation Tint B",        0.30f);
+
+    defineParam(streakLength,         "Streak Length",          260.0f, eParamProxyScale);
+    defineParam(streakWidth,          "Streak Width",           2.2f,   eParamProxyScale);
+    defineParam(streakIntensity,      "Streak Intensity",       1.0f);
+    defineParam(streakDecay,          "Streak Decay",           2.2f);
+    defineParam(streakTintR,          "Streak Tint R",          0.55f);
+    defineParam(streakTintG,          "Streak Tint G",          0.82f);
+    defineParam(streakTintB,          "Streak Tint B",          1.00f);
+    defineParam(streakChroma,         "Streak Chroma",          0.55f);
+    defineParam(streakAberration,     "Streak Aberration",      0.15f);
+
+    defineParam(mix,                  "Mix",                    1.0f);
+    defineParam(quality,              "Quality",                1);
+  }
+
+  void init() {
+    // Integer bounds for the gather loops — computed once per tile.
+    // 4 sigma covers ~99.99% of a Gaussian — anything beyond is invisible.
+    halRadius  = max(1, int(ceil(halationSize)));
+    strRadiusX = max(1, int(ceil(streakLength)));
+    strRadiusY = max(1, int(ceil(streakWidth * 4.0f)));
+    qStep      = max(1, quality);
+  }
+
+  void process(int2 pos) {
+    float4 srcPix = src(pos.x, pos.y);
+    float4 glow   = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // Derived per-pixel constants. Cheap to recompute and keeps init() free
+    // of anything that would otherwise depend on these float params at call
+    // time.
+    float halSizeR   = max(1.0f, halationSize);
+    float halSizeG   = max(1.0f, halationSize * halationGreenScale);
+    float halSizeB   = max(1.0f, halationSize * halationBlueScale);
+    float halSizeRSq = halSizeR * halSizeR;
+
+    float tSoft = max(thresholdSmoothness, 1e-5f);
+    float kneeK = max(hdrKnee, 1e-5f);
+
+    float strLenF  = max(1.0f, streakLength);
+    float strSigma = max(1e-5f, streakWidth);
+    float strSig2  = strSigma * strSigma;
+    float aberr    = clamp(streakAberration, 0.0f, 1.0f);
+
+    // When Quality > 1 we stride the loops, so each sampled pixel represents
+    // (qStep * qStep) pixels' worth of contribution. Multiplying the gain by
+    // this area keeps final brightness roughly consistent across quality
+    // settings.
+    float qCompensate = float(qStep * qStep);
+
+    // =============================================================
+    // HALATION PASS — per-channel radial glow with wavelength scaling
+    // =============================================================
+    for (int oy = -halRadius; oy <= halRadius; oy += qStep) {
+      for (int ox = -halRadius; ox <= halRadius; ox += qStep) {
+        // Square -> circle gate using squared distance (skips corner pixels
+        // and avoids a sqrt on rejects).
+        float distSq = float(ox * ox + oy * oy);
+        if (distSq > halSizeRSq) {
+          continue;
+        }
+
+        float4 c = src(pos.x + ox, pos.y + oy);
+        float lum = c.x * LUMA_R + c.y * LUMA_G + c.z * LUMA_B;
+        if (lum <= threshold) {
+          continue;
+        }
+
+        float dist = sqrt(distSq);
+
+        // Soft threshold ramp above the hard cutoff + Reinhard HDR knee.
+        // seedGain is a scalar in [0, intensity * qCompensate).
+        float tFactor  = clamp((lum - threshold) / tSoft, 0.0f, 1.0f);
+        float lumComp  = lum / (lum + kneeK);
+        float seedGain = tFactor * lumComp * halationIntensity * qCompensate;
+
+        // Per-channel exponential falloffs. Red reaches the full radius;
+        // green and blue decay within their (smaller) scaled radii. Pixels
+        // outside a given channel's radius simply contribute 0 to that
+        // channel — which is what gives halation its characteristic warm
+        // outer ring fading to nothing in blue.
+        float tR = dist / halSizeR;
+        float wR = exp(-halationDecay * tR);
+
+        float wG = 0.0f;
+        if (dist <= halSizeG) {
+          float tG = dist / halSizeG;
+          wG = exp(-halationDecay * tG);
+        }
+
+        float wB = 0.0f;
+        if (dist <= halSizeB) {
+          float tB = dist / halSizeB;
+          wB = exp(-halationDecay * tB);
+        }
+
+        glow.x += c.x * halationTintR * (seedGain * wR);
+        glow.y += c.y * halationTintG * (seedGain * wG);
+        glow.z += c.z * halationTintB * (seedGain * wB);
+      }
+    }
+
+    // =============================================================
+    // ANAMORPHIC STREAK PASS — horizontal, Gaussian cross-section
+    // =============================================================
+    for (int oy = -strRadiusY; oy <= strRadiusY; oy += qStep) {
+      // Perpendicular (vertical) Gaussian is shared by every pixel in this
+      // row — compute once per row rather than per sample.
+      float yDist = float(oy);
+      float wPerp = exp(-0.5f * (yDist * yDist) / strSig2);
+
+      // Skip the whole row if its Gaussian weight is negligible. Huge
+      // speedup when Streak Width is set high — entire Y rows drop out
+      // before any X scanning happens.
+      if (wPerp < 1e-4f) {
+        continue;
+      }
+
+      for (int ox = -strRadiusX; ox <= strRadiusX; ox += qStep) {
+        float4 c = src(pos.x + ox, pos.y + oy);
+        float lum = c.x * LUMA_R + c.y * LUMA_G + c.z * LUMA_B;
+        if (lum <= threshold) {
+          continue;
+        }
+
+        float tFactor  = clamp((lum - threshold) / tSoft, 0.0f, 1.0f);
+        float lumComp  = lum / (lum + kneeK);
+        float seedBase = tFactor * lumComp * streakIntensity * qCompensate;
+
+        // Normalized along-streak distance 0..1 (0 = source column, 1 = tip)
+        float xDistAbs = fabs(float(ox));
+        float tLen = xDistAbs / strLenF;
+        if (tLen > 1.0f) {
+          tLen = 1.0f;
+        }
+
+        // Per-channel along-streak decay — chromatic dispersion. Red decays
+        // fastest (shortest effective streak) while blue decays slowest
+        // (longest effective streak), so the tips skew cool automatically
+        // before any explicit tinting is applied.
+        float decayBase = streakDecay * tLen;
+        float wAlongR = exp(-decayBase * (1.0f + aberr));
+        float wAlongG = exp(-decayBase);
+        float wAlongB = exp(-decayBase * (1.0f - aberr));
+
+        // Chromatic tint ramps in toward the tips — blends source color
+        // with the cool tint based on how far along the streak we are.
+        // (Implemented as a linear cross-fade because BlinkScript has no
+        // mix()/step()/smoothstep() built-in.)
+        float chromaAt = clamp(streakChroma * tLen, 0.0f, 1.0f);
+        float tR = streakTintR * chromaAt + (1.0f - chromaAt);
+        float tG = streakTintG * chromaAt + (1.0f - chromaAt);
+        float tB = streakTintB * chromaAt + (1.0f - chromaAt);
+
+        float gainCommon = seedBase * wPerp;
+        glow.x += c.x * tR * (gainCommon * wAlongR);
+        glow.y += c.y * tG * (gainCommon * wAlongG);
+        glow.z += c.z * tB * (gainCommon * wAlongB);
+      }
+    }
+
+    // =============================================================
+    // Composite — source + effect*mix, preserve source alpha
+    // =============================================================
+    float finalMix = clamp(mix, 0.0f, 1.0f);
+    float4 outPix;
+    outPix.x = srcPix.x + glow.x * finalMix;
+    outPix.y = srcPix.y + glow.y * finalMix;
+    outPix.z = srcPix.z + glow.z * finalMix;
+    outPix.w = srcPix.w;
+
+    dst() = outPix;
+  }
+};

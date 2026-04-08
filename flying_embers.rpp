@@ -1,199 +1,220 @@
-// Flying Embers Particle BlinkScript for Nuke14
-// Creates embers that fly upward from ground plane with turbulence and fade over lifetime
+// Flying Embers Particle BlinkScript for Nuke 14
+// Simulates glowing embers that rise with turbulence, shrink and fade over their lifetime.
 
 #define PI 3.14159265359f
 
-// Simple 3D noise function for turbulence
-float noise3D(float3 p) {
+/* ------------------------------------------------------------------
+   Helper noise functions
+------------------------------------------------------------------ */
+
+// Simple 3‑D value‑noise ‑ cheap but good enough for turbulence
+float noise3D(float3 p)
+{
     float3 i = floor(p);
     float3 f = p - i;
-    f = f * f * (3.0f - 2.0f * f); // smoothstep
-    
-    float n = i.x + i.y * 57.0f + i.z * 113.0f;
-    float a = sin(n) * 43758.5453f;
-    float b = sin(n + 1.0f) * 43758.5453f;
-    float c = sin(n + 57.0f) * 43758.5453f;
-    float d = sin(n + 58.0f) * 43758.5453f;
-    float e = sin(n + 113.0f) * 43758.5453f;
-    float f1 = sin(n + 114.0f) * 43758.5453f;
-    float g = sin(n + 170.0f) * 43758.5453f;
-    float h = sin(n + 171.0f) * 43758.5453f;
-    
-    // Interpolate
-    float k0 = a * (1.0f - f.x) + b * f.x;
-    float k1 = c * (1.0f - f.x) + d * f.x;
-    float k2 = e * (1.0f - f.x) + f1 * f.x;
-    float k3 = g * (1.0f - f.x) + h * f.x;
-    
+    f = f * f * (3.0f - 2.0f * f);      // smoothstep
+
+    float n  = i.x + i.y * 57.0f + i.z * 113.0f;
+    float a  = sin(n)       * 43758.5453f;
+    float b  = sin(n +  1 ) * 43758.5453f;
+    float c  = sin(n + 57 ) * 43758.5453f;
+    float d  = sin(n + 58 ) * 43758.5453f;
+    float e  = sin(n + 113) * 43758.5453f;
+    float f1 = sin(n + 114) * 43758.5453f;
+    float g  = sin(n + 170) * 43758.5453f;
+    float h  = sin(n + 171) * 43758.5453f;
+
+    float k0 = a  * (1.0f - f.x) + b  * f.x;
+    float k1 = c  * (1.0f - f.x) + d  * f.x;
+    float k2 = e  * (1.0f - f.x) + f1 * f.x;
+    float k3 = g  * (1.0f - f.x) + h  * f.x;
+
     float m0 = k0 * (1.0f - f.y) + k1 * f.y;
     float m1 = k2 * (1.0f - f.y) + k3 * f.y;
-    
-    return fabs((m0 * (1.0f - f.z) + m1 * f.z) - floor((m0 * (1.0f - f.z) + m1 * f.z)));
+
+    return fabs((m0 * (1.0f - f.z) + m1 * f.z)
+                - floor(m0 * (1.0f - f.z) + m1 * f.z));
 }
 
-// Fractional Brownian Motion for more complex noise
-float fbm(float3 p, int octaves) {
-    float value = 0.0f;
+// Fractional Brownian Motion – sums several octaves of noise
+float fbm(float3 p, int octaves)
+{
+    float value     = 0.0f;
     float amplitude = 0.5f;
     float frequency = 1.0f;
-    
-    for (int i = 0; i < octaves; i++) {
-        value += amplitude * noise3D(p * frequency);
+
+    for (int i = 0; i < octaves; ++i)
+    {
+        value     += amplitude * noise3D(p * frequency);
         amplitude *= 0.5f;
         frequency *= 2.0f;
     }
     return value;
 }
 
-kernel FlyingEmbers : ImageComputationKernel<ePixelWise> {
-    
-    // Declare particle attributes as Images
-    Image<eReadWrite> p_position;
-    Image<eReadWrite> p_velocity;
-    Image<eReadWrite> p_color;
-    Image<eReadWrite> p_size;
-    Image<eReadWrite> p_age;
-    
-    // Declare our parameter storage
+/* ------------------------------------------------------------------
+   Kernel
+------------------------------------------------------------------ */
+
+kernel FlyingEmbers : ImageComputationKernel<ePixelWise>
+{
+    /* Particle attribute images
+       We read/write position, velocity, colour and size.
+       Age is read‑only.                                            */
+
+    Image<eReadWrite> p_position;   // float3 / float4
+    Image<eReadWrite> p_velocity;   // float3 / float4
+    Image<eReadWrite> p_color;      // float4
+    Image<eReadWrite> p_size;       // float4 – we’ll use .x
+    Image<eRead>      p_age;        // float4 – we’ll use .x
+
+    /* Public parameters – exposed as knobs on the node */
     param:
         float upward_force;        // Base upward velocity
-        float turbulence_strength; // Strength of noise-based turbulence  
+        float turbulence_strength; // Strength of noise‑based turbulence
         float turbulence_scale;    // Scale of turbulence noise
         float gravity;             // Downward acceleration
         float air_resistance;      // Drag coefficient
         float ground_level;        // Y position of ground plane
-        float fade_start_age;      // Age when fading begins (0-1)
-        float ember_heat_glow;     // Heat glow intensity
-        float size_decay_rate;     // How fast embers shrink
-        float rotation_speed;      // Angular velocity variation
+        float fade_start_age;      // Age (0‑1) when fading begins
+        float ember_heat_glow;     // Heat glow intensity multiplier
+        float size_decay_rate;     // Shrink rate
+        float rotation_speed;      // Not used currently – reserved
         float wind_strength;       // Horizontal wind force
-        float3 wind_direction;     // Wind direction vector
-        float heat_color_mix;      // Mix between orange/red colors
-        float spark_probability;   // Chance of sparking behavior
-        float _dt;                 // Delta time
-    
-    void define() {
-        defineParam(upward_force, "Upward Force", 2.0f);
-        defineParam(turbulence_strength, "Turbulence Strength", 1.5f);
-        defineParam(turbulence_scale, "Turbulence Scale", 0.1f);
-        defineParam(gravity, "Gravity", -0.98f);
-        defineParam(air_resistance, "Air Resistance", 0.02f);
-        defineParam(ground_level, "Ground Level", 0.0f);
-        defineParam(fade_start_age, "Fade Start Age", 0.6f);
-        defineParam(ember_heat_glow, "Heat Glow", 1.2f);
-        defineParam(size_decay_rate, "Size Decay Rate", 0.8f);
-        defineParam(rotation_speed, "Rotation Speed", 1.0f);
-        defineParam(wind_strength, "Wind Strength", 0.5f);
-        defineParam(wind_direction, "Wind Direction", float3(1.0f, 0.0f, 0.0f));
-        defineParam(heat_color_mix, "Heat Color Mix", 0.7f);
-        defineParam(spark_probability, "Spark Probability", 0.1f);
-        defineParam(_dt, "_dt", 1.0f);
+        float wind_dir_x;
+        float wind_dir_y;
+        float wind_dir_z;
+        float heat_color_mix;      // Reserved – not used for now
+        float spark_probability;   // Chance of a particle “spark”
+        float _dt;                 // Frame time step (set by node)
+
+    void define()
+    {
+        defineParam(upward_force,        "Upward Force",       2.0f);
+        defineParam(turbulence_strength, "Turbulence Strength",1.5f);
+        defineParam(turbulence_scale,    "Turbulence Scale",   0.1f);
+        defineParam(gravity,             "Gravity",           -0.98f);
+        defineParam(air_resistance,      "Air Resistance",     0.02f);
+        defineParam(ground_level,        "Ground Level",       0.0f);
+        defineParam(fade_start_age,      "Fade Start Age",     0.6f);
+        defineParam(ember_heat_glow,     "Heat Glow",          1.2f);
+        defineParam(size_decay_rate,     "Size Decay Rate",    0.8f);
+        defineParam(rotation_speed,      "Rotation Speed",     1.0f);
+        defineParam(wind_strength,       "Wind Strength",      0.5f);
+        defineParam(wind_dir_x,          "Wind Dir X",         1.0f);
+        defineParam(wind_dir_y,          "Wind Dir Y",         0.0f);
+        defineParam(wind_dir_z,          "Wind Dir Z",         0.0f);
+        defineParam(heat_color_mix,      "Heat Color Mix",     0.7f);
+        defineParam(spark_probability,   "Spark Probability",  0.1f);
+        defineParam(_dt,                 "_dt",               1.0f);
     }
-    
-    void process() {
-        // Get particle properties from images
-        float3 pos = p_position().xyz;
-        float3 vel = p_velocity().xyz;
-        float4 color = p_color();
-        float size = p_size().x;
-        float age = p_age().x;
-        
-        float life = 1.0f - age;
-        float dt = _dt / 24.0f; // Convert to frame time
-        
-        // Generate turbulence using particle position and time
-        float time_offset = age * 10.0f; // Evolve noise over particle lifetime
-        float3 noise_pos = pos * turbulence_scale + float3(time_offset, time_offset * 0.7f, time_offset * 1.3f);
-        
-        // Multi-octave noise for complex turbulence
-        float3 turbulence = float3(
-            fbm(noise_pos, 3) - 0.5f,
-            fbm(noise_pos + float3(17.3f, 23.1f, 31.7f), 3) - 0.5f,
-            fbm(noise_pos + float3(41.2f, 53.7f, 67.1f), 3) - 0.5f
-        ) * turbulence_strength;
-        
-        // Apply forces
-        float3 forces = float3(0.0f);
-        
-        // Upward force (strongest when young, weakens with age)
-        forces.y += upward_force * life * life;
-        
+
+    /* --------------------------------------------------------------
+       Per‑particle processing
+    -------------------------------------------------------------- */
+    void process()
+    {
+        /* Read current particle state --------------------------- */
+
+        float3 pos = p_position();
+        float3 vel = p_velocity();
+
+        float  size = p_size().x;
+        float  age  = p_age().x;
+
+        float  life = 1.0f - age;      // 0‑1 remaining life
+        float  dt   = _dt / 24.0f;     // Convert knob value (frames) → seconds
+
+        /* Build turbulence offsets ----------------------------- */
+
+        float timeOffset = age * 10.0f;
+
+        float3 noisePos  = pos * turbulence_scale + float3(timeOffset, timeOffset, timeOffset);
+        float3 noisePos1 = noisePos + float3(17.3f, 23.1f, 31.7f);
+        float3 noisePos2 = noisePos + float3(41.2f, 53.7f, 67.1f);
+
+        float3 turb = float3( fbm(noisePos,  3),
+                              fbm(noisePos1, 3),
+                              fbm(noisePos2, 3) ) - float3(0.5f, 0.5f, 0.5f);
+        turb *= turbulence_strength;
+
+        /* External forces -------------------------------------- */
+
+        float3 force = turb;
+
+        // Updraft proportional to life^2
+        force.y += upward_force * life * life;
+
         // Gravity
-        forces.y += gravity;
-        
-        // Turbulence
-        forces += turbulence;
-        
-        // Wind force
-        float3 normalized_wind = normalize(wind_direction);
-        forces += normalized_wind * wind_strength * (1.0f + 0.5f * noise3D(pos * 0.05f + float3(age * 5.0f)));
-        
-        // Air resistance (opposes velocity)
-        forces -= vel * air_resistance * length(vel);
-        
-        // Update velocity
-        vel += forces * dt;
-        
-        // Update position
-        pos += vel * dt;
-        
-        // Bounce off ground with energy loss
-        if (pos.y < ground_level) {
+        force.y += gravity;
+
+        // Wind
+        float3 windDir  = float3(wind_dir_x, wind_dir_y, wind_dir_z);
+        float  windSeed = noise3D(pos * 0.05f + float3(age * 5.0f, age * 5.0f, age * 5.0f));
+        force += windDir * wind_strength * (1.0f + 0.5f * windSeed);
+
+        // Drag
+        float speed = length(vel);
+        force -= vel * air_resistance * speed;
+
+        /* Integrate -------------------------------------------- */
+
+        vel += force * dt;
+        pos += vel   * dt;
+
+        /* Ground bounce ---------------------------------------- */
+
+        if (pos.y < ground_level)
+        {
             pos.y = ground_level;
-            vel.y = abs(vel.y) * 0.3f; // Bounce with energy loss
-            // Add some random horizontal movement on bounce
-            vel.x += (noise3D(pos + float3(age * 100.0f)) - 0.5f) * 0.5f;
-            vel.z += (noise3D(pos + float3(age * 100.0f + 50.0f)) - 0.5f) * 0.5f;
+            vel.y = fabs(vel.y) * 0.3f;
+
+            vel.x += (noise3D(pos + float3(age * 100.0f, 0.0f,  0.0f)) - 0.5f) * 0.5f;
+            vel.z += (noise3D(pos + float3(age * 100.0f, 0.0f, 50.0f)) - 0.5f) * 0.5f;
         }
-        
-        // Calculate size with decay
-        float size_factor = pow(life, size_decay_rate);
-        float new_size = size * size_factor * (0.5f + 0.5f * noise3D(pos * 0.2f + float3(age * 3.0f)));
-        
-        // Calculate color based on heat and age
-        float heat_factor = life * ember_heat_glow;
-        float3 ember_color;
-        
-        // Create heat gradient: white-hot -> orange -> red -> dark
-        if (heat_factor > 0.8f) {
-            // White hot
-            ember_color = float3(1.0f, 0.9f, 0.7f);
-        } else if (heat_factor > 0.5f) {
-            // Orange hot
-            float mix_factor = (heat_factor - 0.5f) / 0.3f;
-            ember_color = float3(1.0f, 0.3f + 0.6f * mix_factor, 0.1f + 0.6f * mix_factor);
-        } else if (heat_factor > 0.2f) {
-            // Red hot
-            float mix_factor = (heat_factor - 0.2f) / 0.3f;
-            ember_color = float3(0.8f + 0.2f * mix_factor, 0.1f + 0.2f * mix_factor, 0.05f);
-        } else {
-            // Cooling down to dark red/black
-            float mix_factor = heat_factor / 0.2f;
-            ember_color = float3(0.3f * mix_factor, 0.05f * mix_factor, 0.02f * mix_factor);
-        }
-        
-        // Add some color variation with noise
-        float color_noise = noise3D(pos * 0.3f + float3(age * 2.0f));
-        ember_color *= (0.8f + 0.4f * color_noise);
-        
-        // Calculate opacity with fade
+
+        /* Size -------------------------------------------------- */
+
+        float  sizeNoise = noise3D(pos * 0.2f + float3(age * 3.0f, age * 3.0f, age * 3.0f));
+        float  newSize   = size * pow(life, size_decay_rate) * (0.5f + 0.5f * sizeNoise);
+
+        /* Colour & opacity ------------------------------------- */
+
+        float heat = life * ember_heat_glow;
+
+        float3 col;
+
+        if      (heat > 0.8f)                  col = float3(1.0f,                               0.9f,                 0.7f);
+        else if (heat > 0.5f) { float t = (heat - 0.5f) / 0.3f; col = float3(1.0f,               0.3f + 0.6f * t,     0.1f + 0.6f * t); }
+        else if (heat > 0.2f) { float t = (heat - 0.2f) / 0.3f; col = float3(0.8f + 0.2f * t,    0.1f + 0.2f * t,     0.05f); }
+        else                  { float t = heat / 0.2f;          col = float3(0.3f * t,           0.05f * t,           0.02f * t); }
+
+        // Noise tint
+        col *= 0.8f + 0.4f * noise3D(pos * 0.3f + float3(age * 2.0f, age * 2.0f, age * 2.0f));
+
+        // Fade
         float opacity = 1.0f;
-        if (age > fade_start_age) {
-            float fade_progress = (age - fade_start_age) / (1.0f - fade_start_age);
-            opacity = 1.0f - fade_progress * fade_progress; // Quadratic fade
+        if (age > fade_start_age)
+        {
+            float f = (age - fade_start_age) / (1.0f - fade_start_age);
+            opacity = 1.0f - f * f;
         }
-        
-        // Sparking behavior for some particles
-        float spark_factor = noise3D(pos * 0.1f + float3(age * 20.0f));
-        if (spark_factor > (1.0f - spark_probability)) {
-            ember_color *= 1.5f + 0.5f * sin(age * 50.0f); // Flickering
-            new_size *= 1.2f;
+
+        /* Sparks ----------------------------------------------- */
+
+        if (noise3D(pos * 0.1f + float3(age * 20.0f, age * 20.0f, age * 20.0f)) > 1.0f - spark_probability)
+        {
+            float flicker = 1.5f + 0.5f * sin(age * 50.0f);
+            col     *= flicker;
+            newSize *= 1.2f;
         }
-        
-        // Write back to particle attributes
-        p_position() = float4(pos, 1.0f);
-        p_velocity() = float4(vel, 0.0f);
-        p_color() = float4(ember_color, opacity);
-        p_size() = float4(new_size, 0.0f, 0.0f, 0.0f);
+
+        /* Write back ------------------------------------------- */
+
+        p_position() = float4(pos.x, pos.y, pos.z, 0.0f);
+        p_velocity() = float4(vel.x, vel.y, vel.z, 0.0f);
+        p_color()    = float4(col.x, col.y, col.z, opacity);
+        p_size()     = float4(newSize, 0.0f, 0.0f, 0.0f);
+        p_age()      = float4(age, 0.0f, 0.0f, 0.0f);
     }
-}; 
+};

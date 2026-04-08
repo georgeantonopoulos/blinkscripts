@@ -1,0 +1,110 @@
+#define kMaxSamples 32
+
+/*
+  hash01
+  Purpose: Deterministically map a pixel coordinate to a stable random value in
+           [0, 1]. Used to jitter the sample positions and reduce visible
+           stepping without introducing temporal flicker.
+*/
+float hash01(int2 p) {
+  unsigned int h = (unsigned int)p.x * 1973u + (unsigned int)p.y * 9277u + 89173u;
+  h = (h << 13u) ^ h;
+  h = h * (h * h * 15731u + 789221u) + 1376312589u;
+  return float(h & 0x00ffffffu) / 16777215.0f;
+}
+
+/*
+  FastZoomBlur
+  Purpose: Create a fast zoom/radial blur by back-sampling from the current
+           pixel toward the blur centre. This makes centre detail extend
+           outward without the expensive neighborhood gathers used by
+           higher-quality streak kernels.
+
+  Practical notes:
+    - `amount` is a fraction of the distance to the centre.
+    - `samples` should usually stay in the 8-16 range for speed.
+    - `innerRadius` leaves the centre sharp before the blur ramps in.
+    - `falloff` shapes how quickly the effect builds as pixels move away from
+      the centre.
+*/
+kernel FastZoomBlur : ImageComputationKernel<ePixelWise> {
+  Image<eRead, eAccessRandom, eEdgeClamped> src;
+  Image<eWrite> dst;
+
+  param:
+    float2 centre;
+    float amount;
+    int samples;
+    float innerRadius;
+    float falloff;
+    float mix;
+
+  local:
+    int actualSamples;
+    float invSampleSpan;
+
+  void define() {
+    defineParam(centre, "Centre", float2(960.0f, 540.0f), eParamProxyScale);
+    defineParam(amount, "Amount", 0.18f);
+    defineParam(samples, "Samples", 12);
+    defineParam(innerRadius, "Inner Radius", 0.0f, eParamProxyScale);
+    defineParam(falloff, "Falloff", 1.25f);
+    defineParam(mix, "Mix", 1.0f);
+  }
+
+  void init() {
+    actualSamples = clamp(samples, 1, kMaxSamples);
+    invSampleSpan = actualSamples > 1 ? 1.0f / float(actualSamples - 1) : 0.0f;
+  }
+
+  void process(int2 pos) {
+    float2 p = float2(float(pos.x), float(pos.y));
+    float2 delta = p - centre;
+    float dist = length(delta);
+
+    float safeInner = max(0.0f, innerRadius);
+    float radialMask = 0.0f;
+    float blurLength = 0.0f;
+    float2 rayDir = float2(0.0f, 0.0f);
+
+    if (actualSamples > 1 && amount > 1e-6f && dist > 1e-6f) {
+      radialMask = clamp((dist - safeInner) / max(dist, 1.0f), 0.0f, 1.0f);
+      radialMask = pow(radialMask, max(0.01f, falloff));
+      blurLength = min(dist, amount * dist * radialMask);
+      rayDir = delta / dist;
+    }
+
+    float jitter = hash01(pos) - 0.5f;
+    float finalMix = clamp(mix, 0.0f, 1.0f) * radialMask;
+
+    for (int c = 0; c < dst.kComps; ++c) {
+      float base = c < src.kComps ? src(pos.x, pos.y, c) : (c == 3 ? 1.0f : 0.0f);
+
+      if (blurLength <= 0.5f || finalMix <= 0.0f) {
+        dst(c) = base;
+        continue;
+      }
+
+      float accum = 0.0f;
+      float weightSum = 0.0f;
+
+      for (int i = 0; i < actualSamples; ++i) {
+        float t = (float(i) + jitter) * invSampleSpan;
+        t = clamp(t, 0.0f, 1.0f);
+
+        // Square the sample distribution so we keep more taps near the current
+        // pixel and avoid washing out detail too aggressively.
+        float shapedT = t * t;
+        float2 samplePos = p - rayDir * (blurLength * shapedT);
+
+        float weight = 1.0f - 0.6f * t;
+        float sampleValue = c < src.kComps ? bilinear(src, samplePos.x, samplePos.y, c) : base;
+        accum += sampleValue * weight;
+        weightSum += weight;
+      }
+
+      float blurred = accum / max(weightSum, 1e-6f);
+      dst(c) = base + (blurred - base) * finalMix;
+    }
+  }
+};

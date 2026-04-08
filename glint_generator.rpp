@@ -1,6 +1,14 @@
 #define PI 3.14159265359f
 
-// Simple spatial hash function (generates float 0-1 from int2)
+/*
+  hash
+  Purpose: Deterministically maps integer pixel coordinates to a pseudo-random
+           float in [0, 1]. Used for per-highlight variation without temporal flicker.
+  Args:
+    p: integer coordinate (e.g., source pixel position)
+  Returns:
+    float in [0, 1]
+*/
 float hash(int2 p) {
   unsigned int h = (unsigned int)p.x * 73856093u ^ (unsigned int)p.y * 19349663u;
   h = (h ^ 61u) ^ (h >> 16u);
@@ -36,8 +44,16 @@ kernel GlintGenerator : ImageComputationKernel<ePixelWise> {
     float thresholdSmoothness; // Smoothness range above threshold
     float aberrationVariation; // Random variation in aberration strength (0-1)
     float thicknessFalloff;    // How thickness decreases with distance (e.g., 1.0)
+    float coreSizeRatio;       // Core halo size as fraction of currentSize (0-1)
+    float coreIntensity;       // Core halo intensity multiplier
+    float armTailDecay;        // Exponential tail decay along arms (higher = shorter tails)
+    float haloIntensity;       // Subtle isotropic halo intensity multiplier
+    float haloDecay;           // Exponential halo decay (higher = faster fade)
 
-  // Define parameters with defaults and labels for the Nuke UI
+  /*
+    define
+    Purpose: Register kernel parameters and defaults for the Nuke UI.
+  */
   void define() {
     defineParam(threshold, "Threshold", 0.8f);
     defineParam(size, "Size", 50.0f);
@@ -56,9 +72,22 @@ kernel GlintGenerator : ImageComputationKernel<ePixelWise> {
     defineParam(thresholdSmoothness, "Threshold Smoothness", 0.1f);
     defineParam(aberrationVariation, "Aberration Variation", 0.5f);
     defineParam(thicknessFalloff, "Thickness Falloff", 1.0f);
+    defineParam(coreSizeRatio, "Core Size (Ratio)", 0.15f);
+    defineParam(coreIntensity, "Core Intensity", 1.25f);
+    defineParam(armTailDecay, "Arm Tail Decay", 3.0f);
+    defineParam(haloIntensity, "Halo Intensity", 0.1f);
+    defineParam(haloDecay, "Halo Decay", 2.0f);
   }
 
-  // Process function executed for each output pixel
+  /*
+    process
+    Purpose: Accumulates star-shaped glint contributions at output pixel `pos`
+             from bright source pixels in a local neighborhood. Produces a
+             small Gaussian core plus crisp, Gaussian-profiled arms with
+             chromatic falloff.
+    Args:
+      pos: output pixel coordinate
+  */
   void process(int2 pos) {
     float4 finalGlintColor = float4(0.0f);
     int baseSearchRadius = int(ceil(size * (1.0f + sizeLuminanceScale + sizeVariation))); // Estimate max possible search radius
@@ -105,8 +134,28 @@ kernel GlintGenerator : ImageComputationKernel<ePixelWise> {
           float2 delta = float2(float(-ix_offset), float(-iy_offset));
           float dist = length(delta);
 
-          // --- Glint Arm Calculation ---
-          if (dist > 1e-5f && dist < currentSize) { // Use currentSize
+          // --- Add small radial core (Gaussian) to sell the glint center ---
+          if (dist < currentSize) {
+            float coreRadius = max(1e-5f, currentSize * clamp(coreSizeRatio, 0.0f, 1.0f));
+            float coreWeight = exp(-0.5f * (dist * dist) / (coreRadius * coreRadius));
+            float coreBrightness = currentIntensity * centerLuminance * thresholdFactor * coreIntensity * coreWeight;
+            finalGlintColor.x += centerPixelValue.x * coreBrightness;
+            finalGlintColor.y += centerPixelValue.y * coreBrightness;
+            finalGlintColor.z += centerPixelValue.z * coreBrightness;
+          }
+
+          // --- Subtle isotropic halo with exponential decay for persistence ---
+          {
+            float sizeScale = max(1e-5f, currentSize);
+            float haloWeight = exp(-haloDecay * (dist / sizeScale));
+            float haloBrightness = currentIntensity * centerLuminance * thresholdFactor * haloIntensity * haloWeight;
+            finalGlintColor.x += centerPixelValue.x * haloBrightness;
+            finalGlintColor.y += centerPixelValue.y * haloBrightness;
+            finalGlintColor.z += centerPixelValue.z * haloBrightness;
+          }
+
+          // --- Glint Arm Calculation with smooth exponential tail (no hard cutoff) ---
+          if (dist > 1e-5f) {
             float angle = atan2(delta.y, delta.x) + currentRotationRad; // Use currentRotationRad
             float min_angle_diff = PI;
             float closest_arm_angle = 0.0f; // Store angle of the closest arm
@@ -137,10 +186,16 @@ kernel GlintGenerator : ImageComputationKernel<ePixelWise> {
 
             // Check against the final varied thickness
             if (min_angle_diff < finalThicknessRad / 2.0f) {
-              // Use finalThicknessRad for sharpness calculation
-              float sharpness_factor = cos(min_angle_diff * PI / finalThicknessRad);
-              sharpness_factor = pow(sharpness_factor, sharpness);
-              float base_glint_brightness = currentIntensity * centerLuminance * sharpness_factor * thresholdFactor;
+              // Gaussian arm profile using perpendicular distance to closest arm
+              float d_perp = fabs(sin(min_angle_diff)) * dist;                   // distance to arm centerline
+              float armSigma = max(1e-5f, dist * (finalThicknessRad * 0.5f));    // width grows linearly with distance
+              float armWeight = exp(-0.5f * (d_perp * d_perp) / (armSigma * armSigma));
+              armWeight = pow(armWeight, sharpness); // preserve "Sharpness" control
+
+              // Exponential radial tail for photorealistic persistence
+              float sizeScale = max(1e-5f, currentSize);
+              float radialTail = exp(-armTailDecay * (dist / sizeScale));
+              float base_glint_brightness = currentIntensity * centerLuminance * armWeight * radialTail * thresholdFactor;
 
               // Apply REVERSED + VARIED aberration for falloff (Warm Center / Cool Tips)
               // Red/Green fall off together, Blue falls off slowest
@@ -148,9 +203,11 @@ kernel GlintGenerator : ImageComputationKernel<ePixelWise> {
               float dist_g = dist;
               float dist_b = dist * (1.0f - currentAberration); // '-' makes distance smaller -> slower falloff
 
-              float falloff_r = pow(max(0.0f, 1.0f - (dist_r / currentSize)), falloff);
-              float falloff_g = pow(max(0.0f, 1.0f - (dist_g / currentSize)), falloff);
-              float falloff_b = pow(max(0.0f, 1.0f - (dist_b / currentSize)), falloff);
+              // Chromatic exponential falloff per channel
+              float fallScale = sizeScale;
+              float falloff_r = exp(-falloff * (dist_r / fallScale));
+              float falloff_g = exp(-falloff * (dist_g / fallScale));
+              float falloff_b = exp(-falloff * (dist_b / fallScale));
 
               finalGlintColor.x += centerPixelValue.x * base_glint_brightness * falloff_r;
               finalGlintColor.y += centerPixelValue.y * base_glint_brightness * falloff_g;

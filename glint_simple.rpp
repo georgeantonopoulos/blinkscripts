@@ -1,0 +1,206 @@
+#define PI 3.14159265359f
+
+/*
+  luminance
+  Purpose: Compute perceptual luminance from an RGBA pixel using Rec. 709 weights.
+  Args:
+    c: float4 RGBA color
+  Returns:
+    float luminance in [0, +inf)
+*/
+float luminance(float4 c) {
+  return dot(float3(c.x, c.y, c.z), float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+/*
+  wrapAngleDiff
+  Purpose: Normalize an angle difference to [-PI, PI] to find the smallest
+           absolute angular distance between two angles.
+  Args:
+    a: angle in radians
+  Returns:
+    float in [-PI, PI]
+*/
+float wrapAngleDiff(float a) {
+  return atan2(sin(a), cos(a));
+}
+
+/*
+  softKneeHDR
+  Purpose: Compress high dynamic range luminance smoothly so very bright
+           highlights do not blow out or create blocky artifacts.
+  Args:
+    lum: raw luminance (can be >> 1.0 in linear EXRs)
+    knee: knee value where compression becomes significant
+  Returns:
+    compressed luminance weight in [0, 1)
+*/
+float softKneeHDR(float lum, float knee) {
+  // Reinhard-like tone mapping  lum / (lum + knee)
+  return lum / (lum + knee);
+}
+
+// Local-maximum gating is implemented inline in process() to avoid using Image types outside the kernel scope.
+
+/*
+  GlintSimple
+  Purpose: Generate photorealistic glints with minimal controls. Uses a compact
+           diffraction-like star profile: Gaussian core, Gaussian cross-arm
+           profile, and exponential radial tails for smooth persistence.
+  Images:
+    src: input image (read, random access)
+    dst: output image (write)
+  Parameters:
+    - threshold: highlight detection threshold (0-1 normalized)
+    - size: overall glint scale in pixels
+    - intensity: overall strength multiplier
+    - rotationDeg: rotation of star arms in degrees
+*/
+kernel GlintSimple : ImageComputationKernel<ePixelWise> {
+  Image<eRead, eAccessRandom, eEdgeClamped> src;
+  Image<eWrite> dst;
+
+  // Minimal user parameters
+  param:
+    float threshold;
+    float size;
+    float intensity;
+    float rotationDeg;
+
+  /*
+    define
+    Purpose: Register UI parameters with defaults.
+  */
+  void define() {
+    defineParam(threshold,   "Threshold", 0.85f);
+    defineParam(size,        "Size",      45.0f);
+    defineParam(intensity,   "Intensity", 1.0f);
+    defineParam(rotationDeg, "Rotation",  0.0f);
+  }
+
+  /*
+    process
+    Purpose: At output pixel `pos`, accumulate contributions from nearby bright
+             source pixels that act as glint seeds. Each contributor adds a
+             Gaussian core, Gaussian-profiled arms, and an exponential halo.
+    Args:
+      pos: output pixel coordinate
+  */
+  void process(int2 pos) {
+    // Internal shaping constants (chosen empirically for a realistic look)
+    const int   NUM_ARMS          = 8;            // fixed number of spikes
+    const float ARM_THICKNESS_DEG = 1.2f;         // arm thickness in degrees
+    const float SHARPNESS         = 3.0f;         // perpendicular sharpness
+    const float RADIAL_DECAY      = 2.2f;         // arm tail decay factor
+    const float CORE_RATIO        = 0.12f;        // core radius as fraction of size
+    const float CORE_GAIN         = 1.15f;        // core intensity boost
+    const float HALO_GAIN         = 0.04f;        // isotropic halo weight (reduced)
+    const float HALO_DECAY        = 1.6f;         // halo exponential decay
+    const float THRESH_SMOOTH     = 0.08f;        // threshold softening
+    const float HDR_KNEE          = 1.0f;         // HDR compression knee
+
+    float4 outColor = float4(0.0f);
+
+    // Precompute constants
+    float rotationRad   = rotationDeg * PI / 180.0f;
+    float thicknessRad  = ARM_THICKNESS_DEG * PI / 180.0f;
+    float searchRadiusF = max(1.0f, size);
+    int   searchRadius  = int(ceil(searchRadiusF));
+
+    // Neighborhood sweep: treat bright pixels as glint centers
+    for (int oy = -searchRadius; oy <= searchRadius; ++oy) {
+      for (int ox = -searchRadius; ox <= searchRadius; ++ox) {
+        int2 cpos = pos + int2(ox, oy);
+        float4 c = src(cpos.x, cpos.y);
+        float lum = luminance(c);
+        if (lum <= threshold) {
+          continue;
+        }
+
+        // Soft threshold factor for smoother activation near threshold
+        float tFactor = clamp((lum - threshold) / THRESH_SMOOTH, 0.0f, 1.0f);
+
+        // HDR compression to keep extremely bright pixels stable
+        float lumComp  = softKneeHDR(lum, HDR_KNEE);
+        float seedGain = tFactor * lumComp; // unified seed strength in [0,1)
+
+        // Only allow strong local maxima as seeds (prevents white blocks on broad highlights)
+        bool isMax = true;
+        const float eps = 1e-6f;
+        for (int j = -1; j <= 1 && isMax; ++j) {
+          for (int i = -1; i <= 1 && isMax; ++i) {
+            if (i == 0 && j == 0) continue;
+            float4 ccN = src(cpos.x + i, cpos.y + j);
+            float llN = luminance(ccN);
+            if (llN + eps >= lum) {
+              isMax = false;
+            }
+          }
+        }
+        if (!isMax) {
+          continue;
+        }
+
+        // Vector from center pixel to current output pixel
+        float2 delta = float2(float(-ox), float(-oy));
+        float   dist = length(delta);
+        if (dist < 1e-5f) {
+          // Add only core at exact center; arms handled by Gaussian profile too
+          float coreR = max(1e-5f, CORE_RATIO * searchRadiusF);
+          float wCore = exp(-0.5f * (dist * dist) / (coreR * coreR));
+          float coreB = intensity * seedGain * CORE_GAIN * wCore;
+          outColor.x += c.x * coreB;
+          outColor.y += c.y * coreB;
+          outColor.z += c.z * coreB;
+          continue;
+        }
+
+        // Gaussian core contribution (localized)
+        float coreR = max(1e-5f, CORE_RATIO * searchRadiusF);
+        float wCore = exp(-0.5f * (dist * dist) / (coreR * coreR));
+        float coreB = intensity * seedGain * CORE_GAIN * wCore;
+        outColor.x += c.x * coreB;
+        outColor.y += c.y * coreB;
+        outColor.z += c.z * coreB;
+
+        // Isotropic halo persistence (very subtle)
+        float wHalo = exp(-HALO_DECAY * (dist / searchRadiusF));
+        float haloB = intensity * seedGain * HALO_GAIN * wHalo;
+        outColor.x += c.x * haloB;
+        outColor.y += c.y * haloB;
+        outColor.z += c.z * haloB;
+
+        // Arm contribution: find closest arm angle
+        float angle = atan2(delta.y, delta.x) + rotationRad;
+        float minAbs = PI;
+        for (int i = 0; i < NUM_ARMS; ++i) {
+          float armA   = (2.0f * PI * i) / float(NUM_ARMS);
+          float diff   = wrapAngleDiff(angle - armA);
+          float a      = fabs(diff);
+          minAbs       = min(minAbs, a);
+        }
+
+        // Perpendicular Gaussian thickness profile
+        // For small angles, sin(theta) ~ theta, but use sin for robustness
+        float dPerp   = fabs(sin(minAbs)) * dist;
+        float sigma   = max(1e-5f, dist * (thicknessRad * 0.5f));
+        float wPerp   = exp(-0.5f * (dPerp * dPerp) / (sigma * sigma));
+        wPerp         = pow(wPerp, SHARPNESS);
+
+        // Exponential radial tail for photorealistic persistence
+        float wRad    = exp(-RADIAL_DECAY * (dist / searchRadiusF));
+
+        float armB = intensity * seedGain * wPerp * wRad;
+        outColor.x += c.x * armB;
+        outColor.y += c.y * armB;
+        outColor.z += c.z * armB;
+      }
+    }
+
+    // Write full vector; alpha set to max(R,G,B). Use `glint_simple_rgb.rpp` if you need RGB-only.
+    outColor.w = max(outColor.x, max(outColor.y, outColor.z));
+    dst() = outColor;
+  }
+};
+
+
