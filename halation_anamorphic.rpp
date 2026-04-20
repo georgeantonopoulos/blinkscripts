@@ -71,7 +71,27 @@
 //                           blue reach further than red along the streak.
 //   Streak Intensity      : overall streak strength.
 //
-//   Mix                   : 0 = source untouched, 1 = full effect composited.
+//   Dirt Amount           : 0..1 — per-seed intensity jitter. Each bright
+//                           source pixel gets a stable multiplier in roughly
+//                           [1 - 0.5*d, 1 + 0.5*d] of the clean value.
+//                           Seeded from the source coordinate so it does
+//                           not flicker in time.
+//   Dirt Hue Shift        : 0..1 — per-seed warm/cool hue push so not all
+//                           halos/streaks share the exact same tint.
+//   Dirt Breakup          : 0..1 — coarse-grained spatial dropout. Bigger
+//                           chunks of the effect dim together, simulating
+//                           damaged/uneven lens coating or film backing.
+//   Dirt Scale            : pixel size of the coarse breakup cells.
+//
+//   Output Mode           : integer knob. 0 = Source + Effect (default,
+//                           one-node final look), 1 = Effect Only (pure
+//                           glow pass, ready for additive comp), 2 =
+//                           Source Only (bypass for A/B compare).
+//                           BlinkScript's compiler does not accept inline
+//                           enum metadata, so this is a plain integer
+//                           slider in the Nuke UI — set it to 0, 1, or 2.
+//   Mix                   : 0 = no effect added, 1 = full effect strength.
+//                           Ignored in Source Only mode.
 //   Quality               : loop stride. 1 = final, 2/4 = fast previews
 //                           (with automatic area compensation so brightness
 //                           matches the final at Quality 1).
@@ -85,6 +105,29 @@
 #define LUMA_R 0.2126f
 #define LUMA_G 0.7152f
 #define LUMA_B 0.0722f
+
+/*
+  hash
+  Purpose: Deterministically map an integer pixel coordinate to a stable
+           pseudo-random float in [0, 1]. Used by the Dirt amount to give
+           each bright SOURCE pixel its own stable per-seed character, so
+           halos and streaks are not uniform — some seeds glow hotter, some
+           cooler, just like real bulbs and lens elements.
+  Note:    Uses unsigned int, which is not in the source-documented Blink
+           scalar types but is used empirically in this repo's other hash
+           functions (see fast_zoom_blur.rpp and glint_generator.rpp).
+*/
+float hash(int2 p) {
+  unsigned int h = (unsigned int)p.x * 73856093u ^ (unsigned int)p.y * 19349663u;
+  h = (h ^ 61u) ^ (h >> 16u);
+  h = h * 9u;
+  h = (h ^ 61u) ^ (h >> 16u);
+  h = h * 9u;
+  h = h ^ (h >> 4u);
+  h = h * 668265261u;
+  h = h ^ (h >> 15u);
+  return float(h) / 4294967295.0f;
+}
 
 kernel HalationAnamorphic : ImageComputationKernel<ePixelWise>
 {
@@ -118,9 +161,28 @@ kernel HalationAnamorphic : ImageComputationKernel<ePixelWise>
     float streakChroma;
     float streakAberration;
 
+    // Dirt / per-seed variation (makes the effect feel organic instead of
+    // mathematically clean). Seeded from source pixel coordinates, so it is
+    // stable across frames and does not flicker.
+    float dirtAmount;       // 0 = clean, 1 = maximum variation per seed
+    float dirtHueShift;     // how much the per-seed hash warms/cools each hit
+    float dirtBreakup;      // coarse on/off spatial breakup (missing lens elements)
+    float dirtScale;        // spatial scale for the coarse breakup (pixels)
+
     // Composite
     float mix;
     int   quality;
+
+    // Output mode — plain int knob (Nuke will show an integer slider).
+    //   0 = Source + Effect  (default, one-node final look)
+    //   1 = Effect Only      (pure glow, ready for additive comp)
+    //   2 = Source Only      (bypass for A/B compare)
+    // NOTE: Blink's BlinkScript node does NOT support the angle-bracket
+    // enum metadata syntax that colorramp.cpp in the repo root tries to
+    // use (`int foo < label:..., enum:"A:B" >`) — that syntax produces
+    // "use of undeclared identifier 'label'" at compile time. The only
+    // source-documented way to declare a param is defineParam() below.
+    int outputMode;
 
   local:
     int halRadius;
@@ -129,31 +191,45 @@ kernel HalationAnamorphic : ImageComputationKernel<ePixelWise>
     int qStep;
 
   void define() {
-    defineParam(threshold,            "Threshold",              0.85f);
-    defineParam(thresholdSmoothness,  "Threshold Smoothness",   0.08f);
-    defineParam(hdrKnee,              "HDR Knee",               1.0f);
+    // Detection — less sensitive defaults. Old 0.85 was catching too much
+    // of the mid-bright content; 0.95 only seeds on genuinely hot pixels.
+    defineParam(threshold,            "Threshold",              0.95f);
+    defineParam(thresholdSmoothness,  "Threshold Smoothness",   0.06f);
+    defineParam(hdrKnee,              "HDR Knee",               1.5f);
 
+    // Halation — intensity dropped from 1.25 to 0.45 and tint warmer
+    // (green lowered, blue lowered) so the ring reads as subtle orange
+    // instead of a bright warm wash.
     defineParam(halationSize,         "Halation Size",          60.0f, eParamProxyScale);
-    defineParam(halationIntensity,    "Halation Intensity",     1.25f);
-    defineParam(halationDecay,        "Halation Decay",         2.2f);
+    defineParam(halationIntensity,    "Halation Intensity",     0.45f);
+    defineParam(halationDecay,        "Halation Decay",         2.6f);
     defineParam(halationGreenScale,   "Halation Green Scale",   0.55f);
     defineParam(halationBlueScale,    "Halation Blue Scale",    0.30f);
     defineParam(halationTintR,        "Halation Tint R",        1.00f);
-    defineParam(halationTintG,        "Halation Tint G",        0.55f);
-    defineParam(halationTintB,        "Halation Tint B",        0.30f);
+    defineParam(halationTintG,        "Halation Tint G",        0.42f);
+    defineParam(halationTintB,        "Halation Tint B",        0.18f);
 
+    // Streak — intensity dropped from 1.0 to 0.35, decay slightly tighter.
     defineParam(streakLength,         "Streak Length",          260.0f, eParamProxyScale);
     defineParam(streakWidth,          "Streak Width",           2.2f,   eParamProxyScale);
-    defineParam(streakIntensity,      "Streak Intensity",       1.0f);
-    defineParam(streakDecay,          "Streak Decay",           2.2f);
+    defineParam(streakIntensity,      "Streak Intensity",       0.35f);
+    defineParam(streakDecay,          "Streak Decay",           2.4f);
     defineParam(streakTintR,          "Streak Tint R",          0.55f);
     defineParam(streakTintG,          "Streak Tint G",          0.82f);
     defineParam(streakTintB,          "Streak Tint B",          1.00f);
     defineParam(streakChroma,         "Streak Chroma",          0.55f);
     defineParam(streakAberration,     "Streak Aberration",      0.15f);
 
+    // Dirt
+    defineParam(dirtAmount,           "Dirt Amount",            0.35f);
+    defineParam(dirtHueShift,         "Dirt Hue Shift",         0.20f);
+    defineParam(dirtBreakup,          "Dirt Breakup",           0.25f);
+    defineParam(dirtScale,            "Dirt Scale",             16.0f, eParamProxyScale);
+
+    // Composite
     defineParam(mix,                  "Mix",                    1.0f);
     defineParam(quality,              "Quality",                1);
+    defineParam(outputMode,           "Output Mode (0=Src+FX 1=FX 2=Src)", 0);
   }
 
   void init() {
@@ -203,7 +279,8 @@ kernel HalationAnamorphic : ImageComputationKernel<ePixelWise>
           continue;
         }
 
-        float4 c = src(pos.x + ox, pos.y + oy);
+        int2 seedPos = int2(pos.x + ox, pos.y + oy);
+        float4 c = src(seedPos.x, seedPos.y);
         float lum = c.x * LUMA_R + c.y * LUMA_G + c.z * LUMA_B;
         if (lum <= threshold) {
           continue;
@@ -216,6 +293,33 @@ kernel HalationAnamorphic : ImageComputationKernel<ePixelWise>
         float tFactor  = clamp((lum - threshold) / tSoft, 0.0f, 1.0f);
         float lumComp  = lum / (lum + kneeK);
         float seedGain = tFactor * lumComp * halationIntensity * qCompensate;
+
+        // -------- DIRT: per-seed stable variation --------
+        // Fine per-seed hash — each bright source pixel gets its own
+        // stable multiplier and hue shift.
+        float sHash = hash(seedPos);            // [0, 1]
+        float sBipolar = sHash * 2.0f - 1.0f;   // [-1, 1]
+
+        // Coarse spatial breakup — quantize the seed coordinate into
+        // dirtScale-sized cells and hash that. Whole cells dim together,
+        // simulating uneven film backing or damaged lens coating.
+        int cellX = int(floor(float(seedPos.x) / max(1.0f, dirtScale)));
+        int cellY = int(floor(float(seedPos.y) / max(1.0f, dirtScale)));
+        float cHash = hash(int2(cellX, cellY)); // [0, 1]
+        float breakup = 1.0f - dirtBreakup * (1.0f - cHash);
+
+        // Per-seed intensity jitter — at max dirtAmount, gain is in
+        // roughly [0.5x, 1.5x] of the clean value.
+        float dirtGain = (1.0f + dirtAmount * sBipolar * 0.5f) * breakup;
+        float seedGainDirty = seedGain * dirtGain;
+
+        // Per-seed hue push — warms or cools each individual halo.
+        // Positive hue shift boosts red and drops blue; negative vice versa.
+        float hueDelta = dirtHueShift * sBipolar;
+        float dR = 1.0f + hueDelta;
+        float dG = 1.0f;
+        float dB = 1.0f - hueDelta;
+        // --------------------------------------------------
 
         // Per-channel exponential falloffs. Red reaches the full radius;
         // green and blue decay within their (smaller) scaled radii. Pixels
@@ -237,9 +341,9 @@ kernel HalationAnamorphic : ImageComputationKernel<ePixelWise>
           wB = exp(-halationDecay * tB);
         }
 
-        glow.x += c.x * halationTintR * (seedGain * wR);
-        glow.y += c.y * halationTintG * (seedGain * wG);
-        glow.z += c.z * halationTintB * (seedGain * wB);
+        glow.x += c.x * halationTintR * dR * (seedGainDirty * wR);
+        glow.y += c.y * halationTintG * dG * (seedGainDirty * wG);
+        glow.z += c.z * halationTintB * dB * (seedGainDirty * wB);
       }
     }
 
@@ -260,7 +364,8 @@ kernel HalationAnamorphic : ImageComputationKernel<ePixelWise>
       }
 
       for (int ox = -strRadiusX; ox <= strRadiusX; ox += qStep) {
-        float4 c = src(pos.x + ox, pos.y + oy);
+        int2 seedPos = int2(pos.x + ox, pos.y + oy);
+        float4 c = src(seedPos.x, seedPos.y);
         float lum = c.x * LUMA_R + c.y * LUMA_G + c.z * LUMA_B;
         if (lum <= threshold) {
           continue;
@@ -269,6 +374,30 @@ kernel HalationAnamorphic : ImageComputationKernel<ePixelWise>
         float tFactor  = clamp((lum - threshold) / tSoft, 0.0f, 1.0f);
         float lumComp  = lum / (lum + kneeK);
         float seedBase = tFactor * lumComp * streakIntensity * qCompensate;
+
+        // -------- DIRT: per-seed stable variation (streak flavor) --------
+        // We hash with a constant offset so streak dirt is INDEPENDENT of
+        // halation dirt from the same source pixel — otherwise a seed
+        // that lost its halo would also lose its streak, which looks
+        // coupled and unnatural.
+        float sHash = hash(int2(seedPos.x + 104729, seedPos.y + 1299709));
+        float sBipolar = sHash * 2.0f - 1.0f;
+
+        int cellX = int(floor(float(seedPos.x) / max(1.0f, dirtScale)));
+        int cellY = int(floor(float(seedPos.y) / max(1.0f, dirtScale)));
+        float cHash = hash(int2(cellX + 31337, cellY + 11));
+        float breakup = 1.0f - dirtBreakup * (1.0f - cHash);
+
+        float dirtGain = (1.0f + dirtAmount * sBipolar * 0.5f) * breakup;
+        float seedBaseDirty = seedBase * dirtGain;
+
+        // Hue push on the streak reads as a subtle color variation
+        // between neighbouring streaks — one cooler, one warmer.
+        float hueDelta = dirtHueShift * sBipolar;
+        float dR = 1.0f + hueDelta;
+        float dG = 1.0f;
+        float dB = 1.0f - hueDelta;
+        // -----------------------------------------------------------------
 
         // Normalized along-streak distance 0..1 (0 = source column, 1 = tip)
         float xDistAbs = fabs(float(ox));
@@ -295,22 +424,42 @@ kernel HalationAnamorphic : ImageComputationKernel<ePixelWise>
         float tG = streakTintG * chromaAt + (1.0f - chromaAt);
         float tB = streakTintB * chromaAt + (1.0f - chromaAt);
 
-        float gainCommon = seedBase * wPerp;
-        glow.x += c.x * tR * (gainCommon * wAlongR);
-        glow.y += c.y * tG * (gainCommon * wAlongG);
-        glow.z += c.z * tB * (gainCommon * wAlongB);
+        float gainCommon = seedBaseDirty * wPerp;
+        glow.x += c.x * tR * dR * (gainCommon * wAlongR);
+        glow.y += c.y * tG * dG * (gainCommon * wAlongG);
+        glow.z += c.z * tB * dB * (gainCommon * wAlongB);
       }
     }
 
     // =============================================================
-    // Composite — source + effect*mix, preserve source alpha
+    // Composite — routed by the Output dropdown
+    //   0 = Source + Effect  : src + glow*mix (one-node final look)
+    //   1 = Effect Only      : pure glow pass, ready to Plus in Nuke
+    //   2 = Source Only      : bypass (A/B compare)
     // =============================================================
     float finalMix = clamp(mix, 0.0f, 1.0f);
     float4 outPix;
-    outPix.x = srcPix.x + glow.x * finalMix;
-    outPix.y = srcPix.y + glow.y * finalMix;
-    outPix.z = srcPix.z + glow.z * finalMix;
-    outPix.w = srcPix.w;
+
+    if (outputMode == 1) {
+      // Effect only — alpha encodes the effect luminance so a downstream
+      // Merge(plus) or Merge(screen) can key off it if needed.
+      outPix.x = glow.x * finalMix;
+      outPix.y = glow.y * finalMix;
+      outPix.z = glow.z * finalMix;
+      outPix.w = max(outPix.x, max(outPix.y, outPix.z));
+    } else if (outputMode == 2) {
+      // Pure passthrough — does not touch the source at all.
+      outPix.x = srcPix.x;
+      outPix.y = srcPix.y;
+      outPix.z = srcPix.z;
+      outPix.w = srcPix.w;
+    } else {
+      // Default: source plus effect (one-node final), preserve source alpha.
+      outPix.x = srcPix.x + glow.x * finalMix;
+      outPix.y = srcPix.y + glow.y * finalMix;
+      outPix.z = srcPix.z + glow.z * finalMix;
+      outPix.w = srcPix.w;
+    }
 
     dst() = outPix;
   }
